@@ -1,15 +1,18 @@
-// Package converter provides audio format conversion without external dependencies.
-// It supports WAV, FLAC, OGG, and MP3 formats using pure Go libraries.
 package converter
 
 import (
-	"errors"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
+
+	shinemp3 "github.com/braheezy/shine-mp3/pkg/mp3"
+	"github.com/go-audio/audio"
+	"github.com/go-audio/wav"
+	gomp3 "github.com/hajimehoshi/go-mp3"
 )
 
 // Format represents audio format
@@ -18,230 +21,75 @@ type Format string
 const (
 	FormatWAV     Format = "wav"
 	FormatMP3     Format = "mp3"
-	FormatFLAC    Format = "flac"
-	FormatOGG     Format = "ogg"
 	FormatUnknown Format = ""
 )
 
-// Common errors
-var (
-	ErrUnsupportedFormat    = errors.New("unsupported audio format")
-	ErrUnsupportedConversion = errors.New("unsupported conversion pair")
-	ErrInvalidInput         = errors.New("invalid input file")
-	ErrEncodingFailed       = errors.New("encoding failed")
-	ErrDecodingFailed       = errors.New("decoding failed")
-)
-
-// Options configures the conversion process
-type Options struct {
-	// MP3 encoding options
-	Bitrate    int // Target bitrate: 128, 192, 256, 320 kbps
-	Quality    int // Quality level: 0 (best) to 9 (worst)
-	
-	// Audio options
-	Channels   int // Number of channels: 1 (mono), 2 (stereo)
-	SampleRate int // Sample rate in Hz: 44100, 48000, etc.
-	
-	// Processing options
-	Normalize    bool // Normalize audio levels
-	TrimSilence  bool // Remove silence from start/end
-	
-	// Output options
-	Overwrite    bool // Overwrite existing files
-	PreserveMeta bool // Try to preserve metadata (limited support)
+// PCMData represents decoded audio
+type PCMData struct {
+	Samples    []int16
+	SampleRate int
+	Channels   int
 }
 
-// DefaultOptions returns sensible default conversion options
-func DefaultOptions() Options {
-	return Options{
-		Bitrate:      192,
-		Quality:      5,
-		Channels:     2,
-		SampleRate:   44100,
-		Normalize:    false,
-		TrimSilence:  false,
-		Overwrite:    false,
-		PreserveMeta: false,
-	}
-}
-
-// Converter handles audio format conversion
+// Converter handles audio conversion
 type Converter struct {
-	opts Options
-	mu   sync.Mutex
+	Bitrate int
 }
 
-// New creates a new Converter with default options
+// New creates a new converter
 func New() *Converter {
-	return &Converter{opts: DefaultOptions()}
+	return &Converter{Bitrate: 192}
 }
 
-// NewWithOptions creates a new Converter with custom options
-func NewWithOptions(opts Options) *Converter {
-	return &Converter{opts: opts}
-}
-
-// Options returns current converter options
-func (c *Converter) Options() Options {
-	return c.opts
-}
-
-// SetOptions updates converter options
-func (c *Converter) SetOptions(opts Options) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.opts = opts
-}
-
-// ConvertFile converts an audio file from one format to another
+// ConvertFile converts audio file
 func (c *Converter) ConvertFile(inputPath, outputPath string) error {
-	// Detect formats from file extensions
 	inputFmt := DetectFormat(inputPath)
 	outputFmt := DetectFormat(outputPath)
-	
-	if inputFmt == FormatUnknown {
-		return fmt.Errorf("%w: cannot detect input format for %s", ErrUnsupportedFormat, inputPath)
-	}
-	if outputFmt == FormatUnknown {
-		return fmt.Errorf("%w: cannot detect output format for %s", ErrUnsupportedFormat, outputPath)
-	}
-	
-	// Check if output exists
-	if !c.opts.Overwrite {
-		if _, err := os.Stat(outputPath); err == nil {
-			return fmt.Errorf("output file already exists: %s (use Overwrite option)", outputPath)
-		}
-	}
-	
-	// Create output directory if needed
-	outDir := filepath.Dir(outputPath)
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return fmt.Errorf("create output directory: %w", err)
-	}
-	
-	// Open input file
-	in, err := os.Open(inputPath)
-	if err != nil {
-		return fmt.Errorf("open input file: %w", err)
-	}
-	defer in.Close()
-	
-	// Create output file
-	out, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("create output file: %w", err)
-	}
-	defer out.Close()
-	
-	// Perform conversion
-	if err := c.Convert(in, out, inputFmt, outputFmt); err != nil {
-		// Clean up failed output
-		os.Remove(outputPath)
-		return err
-	}
-	
-	return nil
-}
 
-// Convert converts audio data from reader to writer
-func (c *Converter) Convert(in io.Reader, out io.Writer, inputFmt, outputFmt Format) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	
-	// Same format - just copy
-	if inputFmt == outputFmt {
-		_, err := io.Copy(out, in)
-		return err
+	if inputFmt == FormatUnknown || outputFmt == FormatUnknown {
+		return fmt.Errorf("unsupported format")
 	}
-	
-	// Get converter function
-	switch {
-	case inputFmt == FormatWAV && outputFmt == FormatMP3:
-		return c.wavToMP3(in, out)
-	case inputFmt == FormatFLAC && outputFmt == FormatMP3:
-		return c.flacToMP3(in, out)
-	case inputFmt == FormatOGG && outputFmt == FormatMP3:
-		return c.oggToMP3(in, out)
-	case inputFmt == FormatMP3 && outputFmt == FormatWAV:
-		return c.mp3ToWAV(in, out)
-	case inputFmt == FormatFLAC && outputFmt == FormatWAV:
-		return c.flacToWAV(in, out)
-	case inputFmt == FormatOGG && outputFmt == FormatWAV:
-		return c.oggToWAV(in, out)
-	case inputFmt == FormatWAV && outputFmt == FormatWAV:
-		// Resample/rechannelize
-		return c.processWAV(in, out)
+
+	// Read input
+	inFile, err := os.Open(inputPath)
+	if err != nil {
+		return fmt.Errorf("open input: %w", err)
+	}
+	defer inFile.Close()
+
+	// Decode to PCM
+	var pcm *PCMData
+	switch inputFmt {
+	case FormatWAV:
+		pcm, err = decodeWAV(inFile)
+	case FormatMP3:
+		pcm, err = decodeMP3(inFile)
 	default:
-		return fmt.Errorf("%w: %s to %s", ErrUnsupportedConversion, inputFmt, outputFmt)
+		return fmt.Errorf("unsupported input format: %s", inputFmt)
+	}
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	// Create output
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("create output: %w", err)
+	}
+	defer outFile.Close()
+
+	// Encode
+	switch outputFmt {
+	case FormatWAV:
+		return encodeWAV(outFile, pcm)
+	case FormatMP3:
+		return encodeMP3(outFile, pcm)
+	default:
+		return fmt.Errorf("unsupported output format: %s", outputFmt)
 	}
 }
 
-// ConvertDir converts all audio files in a directory
-func (c *Converter) ConvertDir(inputDir, outputDir string, outputFmt Format) (*BatchResult, error) {
-	result := &BatchResult{
-		Converted: make([]string, 0),
-		Failed:    make([]FailedFile, 0),
-	}
-	
-	err := filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		
-		// Skip directories
-		if info.IsDir() {
-			return nil
-		}
-		
-		// Check if it's a supported audio file
-		inputFmt := DetectFormat(path)
-		if inputFmt == FormatUnknown {
-			return nil // Skip unsupported files
-		}
-		
-		// Skip if same format
-		if inputFmt == outputFmt {
-			return nil
-		}
-		
-		// Build output path
-		relPath, err := filepath.Rel(inputDir, path)
-		if err != nil {
-			return err
-		}
-		
-		ext := filepath.Ext(relPath)
-		outPath := filepath.Join(outputDir, strings.TrimSuffix(relPath, ext)+"."+string(outputFmt))
-		
-		// Convert file
-		if err := c.ConvertFile(path, outPath); err != nil {
-			result.Failed = append(result.Failed, FailedFile{
-				Path:  path,
-				Error: err.Error(),
-			})
-		} else {
-			result.Converted = append(result.Converted, outPath)
-		}
-		
-		return nil
-	})
-	
-	return result, err
-}
-
-// BatchResult contains results of batch conversion
-type BatchResult struct {
-	Converted []string     `json:"converted"`
-	Failed    []FailedFile `json:"failed"`
-}
-
-// FailedFile represents a file that failed to convert
-type FailedFile struct {
-	Path  string `json:"path"`
-	Error string `json:"error"`
-}
-
-// DetectFormat detects audio format from file path
+// DetectFormat detects audio format from file extension
 func DetectFormat(path string) Format {
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
 	switch ext {
@@ -249,60 +97,155 @@ func DetectFormat(path string) Format {
 		return FormatWAV
 	case "mp3":
 		return FormatMP3
-	case "flac":
-		return FormatFLAC
-	case "ogg", "oga", "ogv":
-		return FormatOGG
 	default:
 		return FormatUnknown
 	}
 }
 
-// DetectFormatFromMIME detects format from MIME type
-func DetectFormatFromMIME(mime string) Format {
-	mime = strings.ToLower(strings.Split(mime, ";")[0])
-	switch mime {
-	case "audio/wav", "audio/wave", "audio/x-wav":
-		return FormatWAV
-	case "audio/mpeg", "audio/mp3":
-		return FormatMP3
-	case "audio/flac", "audio/x-flac":
-		return FormatFLAC
-	case "audio/ogg", "audio/vorbis", "application/ogg":
-		return FormatOGG
-	default:
-		return FormatUnknown
+// decodeWAV decodes WAV to PCM
+func decodeWAV(r io.Reader) (*PCMData, error) {
+	// Read all data (WAV decoder needs ReadSeeker)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
 	}
-}
+	rs := bytes.NewReader(data)
 
-// SupportedInputFormats returns list of supported input formats
-func SupportedInputFormats() []Format {
-	return []Format{FormatWAV, FormatMP3, FormatFLAC, FormatOGG}
-}
-
-// SupportedOutputFormats returns list of supported output formats
-func SupportedOutputFormats() []Format {
-	return []Format{FormatWAV, FormatMP3}
-}
-
-// CanConvert checks if conversion between formats is supported
-func CanConvert(from, to Format) bool {
-	conversions := map[Format][]Format{
-		FormatWAV:  {FormatMP3, FormatWAV},
-		FormatFLAC: {FormatMP3, FormatWAV},
-		FormatOGG:  {FormatMP3, FormatWAV},
-		FormatMP3:  {FormatWAV},
+	decoder := wav.NewDecoder(rs)
+	if !decoder.IsValidFile() {
+		return nil, fmt.Errorf("invalid WAV file")
 	}
-	
-	targets, ok := conversions[from]
-	if !ok {
-		return false
+
+	if err := decoder.FwdToPCM(); err != nil {
+		return nil, err
 	}
-	
-	for _, t := range targets {
-		if t == to {
-			return true
+
+	sampleRate := int(decoder.SampleRate)
+	channels := int(decoder.NumChans)
+	bitDepth := int(decoder.BitDepth)
+
+	// Read all samples
+	buf := &audio.IntBuffer{
+		Data:   make([]int, 0),
+		Format: &audio.Format{SampleRate: sampleRate, NumChannels: channels},
+	}
+
+	tmpBuf := &audio.IntBuffer{
+		Data:   make([]int, 4096),
+		Format: buf.Format,
+	}
+
+	for {
+		n, err := decoder.PCMBuffer(tmpBuf)
+		if err != nil {
+			return nil, err
 		}
+		if n == 0 {
+			break
+		}
+		buf.Data = append(buf.Data, tmpBuf.Data[:n]...)
 	}
-	return false
+
+	// Convert to int16
+	samples := make([]int16, len(buf.Data))
+	var maxVal float64 = 32768
+	if bitDepth == 24 {
+		maxVal = 8388608
+	} else if bitDepth == 32 {
+		maxVal = 2147483648
+	}
+
+	for i, s := range buf.Data {
+		normalized := float64(s) / maxVal * 32767
+		if normalized > 32767 {
+			normalized = 32767
+		} else if normalized < -32768 {
+			normalized = -32768
+		}
+		samples[i] = int16(normalized)
+	}
+
+	return &PCMData{
+		Samples:    samples,
+		SampleRate: sampleRate,
+		Channels:   channels,
+	}, nil
+}
+
+// decodeMP3 decodes MP3 to PCM
+func decodeMP3(r io.Reader) (*PCMData, error) {
+	decoder, err := gomp3.NewDecoder(r)
+	if err != nil {
+		return nil, err
+	}
+
+	sampleRate := decoder.SampleRate()
+
+	// Read all decoded data
+	data, err := io.ReadAll(decoder)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert bytes to int16 (little-endian stereo)
+	samples := make([]int16, len(data)/2)
+	for i := 0; i < len(samples); i++ {
+		samples[i] = int16(data[i*2]) | int16(data[i*2+1])<<8
+	}
+
+	return &PCMData{
+		Samples:    samples,
+		SampleRate: sampleRate,
+		Channels:   2, // go-mp3 always outputs stereo
+	}, nil
+}
+
+// encodeWAV encodes PCM to WAV
+func encodeWAV(w io.Writer, pcm *PCMData) error {
+	dataSize := len(pcm.Samples) * 2
+	fileSize := 36 + dataSize
+	byteRate := pcm.SampleRate * pcm.Channels * 2
+	blockAlign := pcm.Channels * 2
+
+	// RIFF header
+	w.Write([]byte("RIFF"))
+	binary.Write(w, binary.LittleEndian, uint32(fileSize))
+	w.Write([]byte("WAVE"))
+
+	// fmt chunk
+	w.Write([]byte("fmt "))
+	binary.Write(w, binary.LittleEndian, uint32(16))
+	binary.Write(w, binary.LittleEndian, uint16(1)) // PCM
+	binary.Write(w, binary.LittleEndian, uint16(pcm.Channels))
+	binary.Write(w, binary.LittleEndian, uint32(pcm.SampleRate))
+	binary.Write(w, binary.LittleEndian, uint32(byteRate))
+	binary.Write(w, binary.LittleEndian, uint16(blockAlign))
+	binary.Write(w, binary.LittleEndian, uint16(16)) // bits per sample
+
+	// data chunk
+	w.Write([]byte("data"))
+	binary.Write(w, binary.LittleEndian, uint32(dataSize))
+
+	for _, s := range pcm.Samples {
+		binary.Write(w, binary.LittleEndian, s)
+	}
+
+	return nil
+}
+
+// encodeMP3 encodes PCM to MP3 using shine
+func encodeMP3(w io.Writer, pcm *PCMData) error {
+	if len(pcm.Samples) == 0 {
+		return fmt.Errorf("no samples to encode")
+	}
+
+	// shine-mp3 encoder
+	encoder := shinemp3.NewEncoder(pcm.SampleRate, pcm.Channels)
+
+	// Encode and write
+	if err := encoder.Write(w, pcm.Samples); err != nil {
+		return fmt.Errorf("encode mp3: %w", err)
+	}
+
+	return nil
 }
