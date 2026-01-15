@@ -10,9 +10,12 @@ import (
 	"strings"
 
 	shinemp3 "github.com/braheezy/shine-mp3/pkg/mp3"
+	"github.com/formeo/go-audio-converter/pkg/flacenc"
 	"github.com/go-audio/audio"
 	"github.com/go-audio/wav"
 	gomp3 "github.com/hajimehoshi/go-mp3"
+	"github.com/jfreymuth/oggvorbis"
+	"github.com/mewkiz/flac"
 )
 
 // Format represents audio format
@@ -21,6 +24,8 @@ type Format string
 const (
 	FormatWAV     Format = "wav"
 	FormatMP3     Format = "mp3"
+	FormatFLAC    Format = "flac"
+	FormatOGG     Format = "ogg"
 	FormatUnknown Format = ""
 )
 
@@ -33,12 +38,16 @@ type PCMData struct {
 
 // Converter handles audio conversion
 type Converter struct {
-	Bitrate int
+	Bitrate    int
+	OGGQuality float32 // -0.1 to 1.0, default 0.4 (~128kbps)
 }
 
 // New creates a new converter
 func New() *Converter {
-	return &Converter{Bitrate: 192}
+	return &Converter{
+		Bitrate:    192,
+		OGGQuality: 0.4,
+	}
 }
 
 // ConvertFile converts audio file
@@ -50,20 +59,22 @@ func (c *Converter) ConvertFile(inputPath, outputPath string) error {
 		return fmt.Errorf("unsupported format")
 	}
 
-	// Read input
 	inFile, err := os.Open(inputPath)
 	if err != nil {
 		return fmt.Errorf("open input: %w", err)
 	}
 	defer inFile.Close()
 
-	// Decode to PCM
 	var pcm *PCMData
 	switch inputFmt {
 	case FormatWAV:
 		pcm, err = decodeWAV(inFile)
 	case FormatMP3:
 		pcm, err = decodeMP3(inFile)
+	case FormatFLAC:
+		pcm, err = decodeFLAC(inFile)
+	case FormatOGG:
+		pcm, err = decodeOGG(inFile)
 	default:
 		return fmt.Errorf("unsupported input format: %s", inputFmt)
 	}
@@ -71,19 +82,21 @@ func (c *Converter) ConvertFile(inputPath, outputPath string) error {
 		return fmt.Errorf("decode: %w", err)
 	}
 
-	// Create output
 	outFile, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create output: %w", err)
 	}
 	defer outFile.Close()
 
-	// Encode
 	switch outputFmt {
 	case FormatWAV:
 		return encodeWAV(outFile, pcm)
 	case FormatMP3:
 		return encodeMP3(outFile, pcm)
+	case FormatFLAC:
+		return encodeFLAC(outFile, pcm)
+	case FormatOGG:
+		return c.encodeOGG(outFile, pcm)
 	default:
 		return fmt.Errorf("unsupported output format: %s", outputFmt)
 	}
@@ -97,6 +110,10 @@ func DetectFormat(path string) Format {
 		return FormatWAV
 	case "mp3":
 		return FormatMP3
+	case "flac":
+		return FormatFLAC
+	case "ogg", "oga", "ogv":
+		return FormatOGG
 	default:
 		return FormatUnknown
 	}
@@ -104,7 +121,6 @@ func DetectFormat(path string) Format {
 
 // decodeWAV decodes WAV to PCM
 func decodeWAV(r io.Reader) (*PCMData, error) {
-	// Read all data (WAV decoder needs ReadSeeker)
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
@@ -124,7 +140,6 @@ func decodeWAV(r io.Reader) (*PCMData, error) {
 	channels := int(decoder.NumChans)
 	bitDepth := int(decoder.BitDepth)
 
-	// Read all samples
 	buf := &audio.IntBuffer{
 		Data:   make([]int, 0),
 		Format: &audio.Format{SampleRate: sampleRate, NumChannels: channels},
@@ -146,7 +161,6 @@ func decodeWAV(r io.Reader) (*PCMData, error) {
 		buf.Data = append(buf.Data, tmpBuf.Data[:n]...)
 	}
 
-	// Convert to int16
 	samples := make([]int16, len(buf.Data))
 	var maxVal float64 = 32768
 	if bitDepth == 24 {
@@ -181,13 +195,11 @@ func decodeMP3(r io.Reader) (*PCMData, error) {
 
 	sampleRate := decoder.SampleRate()
 
-	// Read all decoded data
 	data, err := io.ReadAll(decoder)
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert bytes to int16 (little-endian stereo)
 	samples := make([]int16, len(data)/2)
 	for i := 0; i < len(samples); i++ {
 		samples[i] = int16(data[i*2]) | int16(data[i*2+1])<<8
@@ -196,7 +208,102 @@ func decodeMP3(r io.Reader) (*PCMData, error) {
 	return &PCMData{
 		Samples:    samples,
 		SampleRate: sampleRate,
-		Channels:   2, // go-mp3 always outputs stereo
+		Channels:   2,
+	}, nil
+}
+
+// decodeFLAC decodes FLAC to PCM
+func decodeFLAC(r io.Reader) (*PCMData, error) {
+	stream, err := flac.New(r)
+	if err != nil {
+		return nil, fmt.Errorf("open flac: %w", err)
+	}
+	defer stream.Close()
+
+	sampleRate := int(stream.Info.SampleRate)
+	channels := int(stream.Info.NChannels)
+	bitsPerSample := int(stream.Info.BitsPerSample)
+
+	var samples []int16
+
+	for {
+		frame, err := stream.ParseNext()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse frame: %w", err)
+		}
+
+		nSamples := int(frame.Subframes[0].NSamples)
+
+		for i := 0; i < nSamples; i++ {
+			for ch := 0; ch < channels; ch++ {
+				sample := frame.Subframes[ch].Samples[i]
+
+				var normalized int16
+				switch bitsPerSample {
+				case 8:
+					normalized = int16(sample << 8)
+				case 16:
+					normalized = int16(sample)
+				case 24:
+					normalized = int16(sample >> 8)
+				case 32:
+					normalized = int16(sample >> 16)
+				default:
+					normalized = int16(sample)
+				}
+				samples = append(samples, normalized)
+			}
+		}
+	}
+
+	return &PCMData{
+		Samples:    samples,
+		SampleRate: sampleRate,
+		Channels:   channels,
+	}, nil
+}
+
+// decodeOGG decodes OGG/Vorbis to PCM
+func decodeOGG(r io.Reader) (*PCMData, error) {
+	reader, err := oggvorbis.NewReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("open ogg: %w", err)
+	}
+
+	sampleRate := reader.SampleRate()
+	channels := reader.Channels()
+
+	floatBuf := make([]float32, 8192)
+	var samples []int16
+
+	for {
+		n, err := reader.Read(floatBuf)
+		if n > 0 {
+			for i := 0; i < n; i++ {
+				sample := floatBuf[i]
+				if sample > 1.0 {
+					sample = 1.0
+				} else if sample < -1.0 {
+					sample = -1.0
+				}
+				samples = append(samples, int16(sample*32767))
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read ogg: %w", err)
+		}
+	}
+
+	return &PCMData{
+		Samples:    samples,
+		SampleRate: sampleRate,
+		Channels:   channels,
 	}, nil
 }
 
@@ -207,22 +314,19 @@ func encodeWAV(w io.Writer, pcm *PCMData) error {
 	byteRate := pcm.SampleRate * pcm.Channels * 2
 	blockAlign := pcm.Channels * 2
 
-	// RIFF header
 	w.Write([]byte("RIFF"))
 	binary.Write(w, binary.LittleEndian, uint32(fileSize))
 	w.Write([]byte("WAVE"))
 
-	// fmt chunk
 	w.Write([]byte("fmt "))
 	binary.Write(w, binary.LittleEndian, uint32(16))
-	binary.Write(w, binary.LittleEndian, uint16(1)) // PCM
+	binary.Write(w, binary.LittleEndian, uint16(1))
 	binary.Write(w, binary.LittleEndian, uint16(pcm.Channels))
 	binary.Write(w, binary.LittleEndian, uint32(pcm.SampleRate))
 	binary.Write(w, binary.LittleEndian, uint32(byteRate))
 	binary.Write(w, binary.LittleEndian, uint16(blockAlign))
-	binary.Write(w, binary.LittleEndian, uint16(16)) // bits per sample
+	binary.Write(w, binary.LittleEndian, uint16(16))
 
-	// data chunk
 	w.Write([]byte("data"))
 	binary.Write(w, binary.LittleEndian, uint32(dataSize))
 
@@ -239,13 +343,29 @@ func encodeMP3(w io.Writer, pcm *PCMData) error {
 		return fmt.Errorf("no samples to encode")
 	}
 
-	// shine-mp3 encoder
 	encoder := shinemp3.NewEncoder(pcm.SampleRate, pcm.Channels)
 
-	// Encode and write
 	if err := encoder.Write(w, pcm.Samples); err != nil {
 		return fmt.Errorf("encode mp3: %w", err)
 	}
 
 	return nil
+}
+
+// encodeFLAC encodes PCM to FLAC
+func encodeFLAC(w io.Writer, pcm *PCMData) error {
+	enc := flacenc.NewEncoder(pcm.SampleRate, pcm.Channels, 16)
+
+	samples32 := make([]int32, len(pcm.Samples))
+	for i, s := range pcm.Samples {
+		samples32[i] = int32(s)
+	}
+
+	return enc.Encode(w, samples32)
+}
+
+// encodeOGG encodes PCM to OGG/Vorbis
+// Note: Pure Go Vorbis encoding doesn't exist. Use CGO with libvorbis (github.com/xlab/vorbis-go)
+func (c *Converter) encodeOGG(w io.Writer, pcm *PCMData) error {
+	return fmt.Errorf("OGG/Vorbis encoding not yet implemented - no pure Go encoder exists, consider CGO with libvorbis")
 }
