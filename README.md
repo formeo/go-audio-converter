@@ -1,3 +1,6 @@
+![Downloads](https://img.shields.io/github/downloads/formeo/go-audio-converter/total)
+![Stars](https://img.shields.io/github/stars/formeo/mgo-audio-converter)
+
 # go-audio-converter
 
 🎵 **Pure Go audio converter — no FFmpeg, no CGO.**
