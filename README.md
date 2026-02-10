@@ -1,5 +1,5 @@
 ![Downloads](https://img.shields.io/github/downloads/formeo/go-audio-converter/total)
-![Stars](https://img.shields.io/github/stars/formeo/mgo-audio-converter)
+![Stars](https://img.shields.io/github/stars/formeo/go-audio-converter)
 
 # go-audio-converter
 
